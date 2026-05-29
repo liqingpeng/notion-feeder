@@ -1,6 +1,5 @@
 /**
  * Notion Feeder lite: sync RSS title + link only (no HTML body blocks).
- * Avoids GitHub Actions 403 when full article blocks fail.
  *
  * Env: NOTION_API_TOKEN, NOTION_FEEDS_DATABASE_ID, NOTION_READER_DATABASE_ID
  * Optional: RUN_FREQUENCY (seconds, default 604800 = 7 days)
@@ -9,7 +8,17 @@
 const { Client } = require('@notionhq/client');
 const Parser = require('rss-parser');
 
-const parser = new Parser();
+const FETCH_HEADERS = {
+  'User-Agent':
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+  Accept: 'application/rss+xml, application/xml, text/xml, */*',
+};
+
+const parser = new Parser({
+  timeout: 30000,
+  headers: FETCH_HEADERS,
+});
+
 const notion = new Client({ auth: process.env.NOTION_API_TOKEN });
 
 const FEEDS_DB = process.env.NOTION_FEEDS_DATABASE_ID;
@@ -18,6 +27,48 @@ const RUN_FREQUENCY = Number(process.env.RUN_FREQUENCY || 604800);
 
 function normalizeId(id) {
   return (id || '').replace(/-/g, '');
+}
+
+function substackRssHubUrl(feedUrl) {
+  const match = feedUrl.match(/https?:\/\/([^.]+)\.substack\.com/i);
+  if (!match) return null;
+  return `https://rsshub.app/substack/${match[1]}`;
+}
+
+function candidateFeedUrls(feedUrl) {
+  const urls = [feedUrl];
+  const hub = substackRssHubUrl(feedUrl);
+  if (hub && !urls.includes(hub)) urls.push(hub);
+  return urls;
+}
+
+async function fetchFeed(feedUrl) {
+  const errors = [];
+
+  for (const url of candidateFeedUrls(feedUrl)) {
+    try {
+      const res = await fetch(url, {
+        headers: FETCH_HEADERS,
+        redirect: 'follow',
+      });
+
+      if (!res.ok) {
+        errors.push(`${url} -> HTTP ${res.status}`);
+        continue;
+      }
+
+      const xml = await res.text();
+      const feed = await parser.parseString(xml);
+      if (url !== feedUrl) {
+        console.log(`  used mirror: ${url}`);
+      }
+      return feed;
+    } catch (err) {
+      errors.push(`${url} -> ${err.message}`);
+    }
+  }
+
+  throw new Error(errors.join(' | '));
 }
 
 async function getEnabledFeeds() {
@@ -67,14 +118,18 @@ async function createReaderItem(item, feedTitle) {
   return 'created';
 }
 
-async function fetchRecentItems(feedUrl) {
-  const rss = await parser.parseURL(feedUrl);
+function filterRecentItems(items) {
   const now = Date.now() / 1000;
-  return rss.items.filter((item) => {
+  return items.filter((item) => {
     const t = new Date(item.pubDate || item.isoDate || 0).getTime() / 1000;
     if (!t) return true;
     return now - t < RUN_FREQUENCY;
   });
+}
+
+async function fetchRecentItems(feedUrl) {
+  const rss = await fetchFeed(feedUrl);
+  return filterRecentItems(rss.items || []);
 }
 
 async function main() {
@@ -91,20 +146,30 @@ async function main() {
 
   let created = 0;
   let skipped = 0;
+  let feedErrors = 0;
 
   for (const feed of feeds) {
     console.log(`fetch: ${feed.title} -> ${feed.feedUrl}`);
-    const items = await fetchRecentItems(feed.feedUrl);
-    console.log(`  recent items: ${items.length}`);
+    try {
+      const items = await fetchRecentItems(feed.feedUrl);
+      console.log(`  recent items: ${items.length}`);
 
-    for (const item of items) {
-      const result = await createReaderItem(item, feed.title);
-      if (result === 'created') created += 1;
-      else skipped += 1;
+      for (const item of items) {
+        const result = await createReaderItem(item, feed.title);
+        if (result === 'created') created += 1;
+        else skipped += 1;
+      }
+    } catch (err) {
+      feedErrors += 1;
+      console.error(`  WARN: feed failed, skip: ${err.message}`);
     }
   }
 
-  console.log(`done. created=${created}, skipped=${skipped}`);
+  console.log(`done. created=${created}, skipped=${skipped}, feedErrors=${feedErrors}`);
+
+  if (feedErrors === feeds.length && feeds.length > 0) {
+    process.exit(1);
+  }
 }
 
 main().catch((err) => {
