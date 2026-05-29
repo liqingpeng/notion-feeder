@@ -5,6 +5,7 @@
  * Optional:
  * - RUN_FREQUENCY (seconds, default 604800 = 7 days)
  * - SYNC_CONTENT=false to disable page body content
+ * - UPDATE_EXISTING=false to skip backfilling existing pages with empty bodies
  * - TRANSLATE_TO=zh-CN to translate with an OpenAI-compatible API
  * - OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL
  * - DEEPSEEK_API_KEY as a convenient OpenAI-compatible fallback
@@ -30,6 +31,7 @@ const FEEDS_DB = process.env.NOTION_FEEDS_DATABASE_ID;
 const READER_DB = process.env.NOTION_READER_DATABASE_ID;
 const RUN_FREQUENCY = Number(process.env.RUN_FREQUENCY || 604800);
 const SYNC_CONTENT = process.env.SYNC_CONTENT !== 'false';
+const UPDATE_EXISTING = process.env.UPDATE_EXISTING !== 'false';
 const CONTENT_CHAR_LIMIT = Number(process.env.CONTENT_CHAR_LIMIT || 6000);
 const TRANSLATE_TO = process.env.TRANSLATE_TO || 'zh-CN';
 const TRANSLATE_CHAR_LIMIT = Number(process.env.TRANSLATE_CHAR_LIMIT || 3500);
@@ -263,7 +265,7 @@ async function getEnabledFeeds() {
   }));
 }
 
-async function readerHasLink(url) {
+async function findReaderPageByLink(url) {
   const res = await notion.databases.query({
     database_id: normalizeId(READER_DB),
     filter: {
@@ -272,7 +274,24 @@ async function readerHasLink(url) {
     },
     page_size: 1,
   });
+  return res.results[0] || null;
+}
+
+async function pageHasChildren(pageId) {
+  const res = await notion.blocks.children.list({
+    block_id: pageId,
+    page_size: 1,
+  });
   return res.results.length > 0;
+}
+
+async function appendChildren(pageId, children) {
+  for (let i = 0; i < children.length; i += 100) {
+    await notion.blocks.children.append({
+      block_id: pageId,
+      children: children.slice(i, i + 100),
+    });
+  }
 }
 
 async function createReaderItem(item, feedTitle) {
@@ -280,7 +299,9 @@ async function createReaderItem(item, feedTitle) {
   const link = item.link || item.guid;
   if (!link) return 'skip-no-link';
 
-  if (await readerHasLink(link)) return 'skip-duplicate';
+  const existingPage = await findReaderPageByLink(link);
+  if (existingPage && !UPDATE_EXISTING) return 'skip-duplicate';
+  if (existingPage && (await pageHasChildren(existingPage.id))) return 'skip-existing-with-content';
 
   const originalText = getItemContent(item);
   const translatedTitle = await translateText(title, 'Article title');
@@ -295,6 +316,25 @@ async function createReaderItem(item, feedTitle) {
     originalText,
     translatedText,
   });
+
+  if (existingPage) {
+    if (!children || children.length === 0) return 'skip-no-content';
+
+    if (translatedTitle) {
+      await notion.pages.update({
+        page_id: existingPage.id,
+        properties: {
+          Title: {
+            title: [{ text: { content: pageTitle.slice(0, 2000) } }],
+          },
+        },
+      });
+    }
+
+    await appendChildren(existingPage.id, children);
+    console.log(`updated: [${feedTitle}] ${pageTitle}`);
+    return 'updated';
+  }
 
   await notion.pages.create({
     parent: { database_id: normalizeId(READER_DB) },
@@ -333,6 +373,7 @@ async function main() {
   console.log(`integration: ${me.name}`);
   console.log(`RUN_FREQUENCY: ${RUN_FREQUENCY}s`);
   console.log(`SYNC_CONTENT: ${SYNC_CONTENT}`);
+  console.log(`UPDATE_EXISTING: ${UPDATE_EXISTING}`);
   console.log(`TRANSLATE_TO: ${TRANSLATE_TO || 'disabled'}`);
   if (TRANSLATE_TO && !getTranslatorConfig()) {
     console.log('translation: disabled (missing OPENAI_API_KEY or DEEPSEEK_API_KEY)');
@@ -342,6 +383,7 @@ async function main() {
   console.log(`enabled feeds: ${feeds.length}`);
 
   let created = 0;
+  let updated = 0;
   let skipped = 0;
   let feedErrors = 0;
 
@@ -354,6 +396,7 @@ async function main() {
       for (const item of items) {
         const result = await createReaderItem(item, feed.title);
         if (result === 'created') created += 1;
+        else if (result === 'updated') updated += 1;
         else skipped += 1;
       }
     } catch (err) {
@@ -362,7 +405,9 @@ async function main() {
     }
   }
 
-  console.log(`done. created=${created}, skipped=${skipped}, feedErrors=${feedErrors}`);
+  console.log(
+    `done. created=${created}, updated=${updated}, skipped=${skipped}, feedErrors=${feedErrors}`
+  );
 
   if (feedErrors === feeds.length && feeds.length > 0) {
     process.exit(1);
