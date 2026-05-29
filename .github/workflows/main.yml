@@ -31,8 +31,9 @@ jobs:
           test "$code" = "200"
 
       - name: Install deps and sync RSS (lite)
-        working-directory: ${{ runner.temp }}/rss-sync
         run: |
+          mkdir -p "${{ runner.temp }}/rss-sync"
+          cd "${{ runner.temp }}/rss-sync"
           npm init -y >/dev/null 2>&1
           npm install @notionhq/client@0.4.9 rss-parser@3.13.0 --no-save --no-package-lock
           cp "$GITHUB_WORKSPACE/notion-sync-lite.js" .
