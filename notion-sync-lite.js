@@ -13,6 +13,8 @@
 
 const { Client } = require('@notionhq/client');
 const Parser = require('rss-parser');
+const { JSDOM } = require('jsdom');
+const { Readability } = require('@mozilla/readability');
 
 const FETCH_HEADERS = {
   'User-Agent':
@@ -35,6 +37,9 @@ const UPDATE_EXISTING = process.env.UPDATE_EXISTING !== 'false';
 const CONTENT_CHAR_LIMIT = Number(process.env.CONTENT_CHAR_LIMIT || 6000);
 const TRANSLATE_TO = process.env.TRANSLATE_TO || 'zh-CN';
 const TRANSLATE_CHAR_LIMIT = Number(process.env.TRANSLATE_CHAR_LIMIT || 3500);
+const FETCH_FULL_ARTICLE = process.env.FETCH_FULL_ARTICLE !== 'false';
+const ARTICLE_MIN_CHARS = Number(process.env.ARTICLE_MIN_CHARS || 1200);
+const BILINGUAL_PARAGRAPH_LIMIT = Number(process.env.BILINGUAL_PARAGRAPH_LIMIT || 16);
 
 function getTranslatorConfig() {
   if (process.env.OPENAI_API_KEY) {
@@ -99,16 +104,50 @@ function htmlToText(value) {
     .trim();
 }
 
-function getItemContent(item) {
+function getFeedItemContent(item) {
   const raw =
-    item.contentSnippet ||
-    item.summary ||
-    item.content ||
     item['content:encoded'] ||
+    item.content ||
     item.description ||
+    item.summary ||
+    item['content:encoded'] ||
+    item.contentSnippet ||
     '';
 
   return htmlToText(raw).slice(0, CONTENT_CHAR_LIMIT);
+}
+
+async function fetchArticleText(url) {
+  if (!FETCH_FULL_ARTICLE || !url) return '';
+
+  try {
+    const res = await fetch(url, {
+      headers: FETCH_HEADERS,
+      redirect: 'follow',
+    });
+
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+
+    const html = await res.text();
+    const dom = new JSDOM(html, { url });
+    const article = new Readability(dom.window.document).parse();
+    return htmlToText(article?.textContent || '').slice(0, CONTENT_CHAR_LIMIT);
+  } catch (err) {
+    console.error(`  WARN: full article fetch failed: ${err.message}`);
+    return '';
+  }
+}
+
+async function getOriginalText(item, link) {
+  const rssText = getFeedItemContent(item);
+  if (!FETCH_FULL_ARTICLE || rssText.length >= ARTICLE_MIN_CHARS) {
+    return rssText;
+  }
+
+  const articleText = await fetchArticleText(link);
+  return articleText.length > rssText.length ? articleText : rssText;
 }
 
 function splitIntoParagraphs(text, maxLength = 1800, maxBlocks = 40) {
@@ -154,6 +193,17 @@ function dividerBlock() {
   return { object: 'block', type: 'divider', divider: {} };
 }
 
+function calloutBlock(content, icon = '🌐') {
+  return {
+    object: 'block',
+    type: 'callout',
+    callout: {
+      icon: { type: 'emoji', emoji: icon },
+      rich_text: [{ type: 'text', text: { content: content.slice(0, 2000) } }],
+    },
+  };
+}
+
 async function translateText(text, context) {
   const config = getTranslatorConfig();
   if (!config || !TRANSLATE_TO || !text) return null;
@@ -195,26 +245,34 @@ async function translateText(text, context) {
   }
 }
 
-function buildChildren({ feedTitle, link, originalText, translatedText }) {
-  if (!SYNC_CONTENT) return undefined;
-
-  const children = [
-    paragraphBlock(`Source: ${feedTitle}`),
-    paragraphBlock(`Link: ${link}`),
-  ];
-
-  if (translatedText) {
-    children.push(headingBlock('Chinese Translation'));
-    for (const paragraph of splitIntoParagraphs(translatedText, 1800, 35)) {
-      children.push(paragraphBlock(paragraph));
-    }
-    if (originalText) children.push(dividerBlock());
+async function translateParagraphs(paragraphs) {
+  const config = getTranslatorConfig();
+  if (!config || !TRANSLATE_TO) {
+    return paragraphs.map((original) => ({ original, translated: null }));
   }
 
-  if (originalText) {
-    children.push(headingBlock('Original Excerpt'));
-    for (const paragraph of splitIntoParagraphs(originalText, 1800, 35)) {
-      children.push(paragraphBlock(paragraph));
+  const pairs = [];
+  for (const original of paragraphs.slice(0, BILINGUAL_PARAGRAPH_LIMIT)) {
+    const translated = await translateText(original.slice(0, 1800), 'Article paragraph');
+    pairs.push({ original, translated });
+  }
+
+  return pairs;
+}
+
+function buildChildren({ feedTitle, bilingualPairs }) {
+  if (!SYNC_CONTENT) return undefined;
+
+  const children = [calloutBlock(`来源：${feedTitle}`, '📰')];
+
+  if (bilingualPairs?.length) {
+    children.push(headingBlock('中英对照'));
+    for (const pair of bilingualPairs) {
+      if (pair.translated) {
+        children.push(paragraphBlock(pair.translated));
+      }
+      children.push(paragraphBlock(`EN: ${pair.original}`));
+      children.push(dividerBlock());
     }
   }
 
@@ -277,12 +335,22 @@ async function findReaderPageByLink(url) {
   return res.results[0] || null;
 }
 
-async function pageHasChildren(pageId) {
+function blockPlainText(block) {
+  const value = block[block.type];
+  return (value?.rich_text || [])
+    .map((part) => part.plain_text || part.text?.content || '')
+    .join('');
+}
+
+async function pageHasSyncedContent(pageId) {
   const res = await notion.blocks.children.list({
     block_id: pageId,
-    page_size: 1,
+    page_size: 20,
   });
-  return res.results.length > 0;
+  return res.results.some((block) => {
+    const text = blockPlainText(block);
+    return text.includes('中英对照') || text.startsWith('EN: ');
+  });
 }
 
 async function appendChildren(pageId, children) {
@@ -301,20 +369,22 @@ async function createReaderItem(item, feedTitle) {
 
   const existingPage = await findReaderPageByLink(link);
   if (existingPage && !UPDATE_EXISTING) return 'skip-duplicate';
-  if (existingPage && (await pageHasChildren(existingPage.id))) return 'skip-existing-with-content';
+  if (existingPage && (await pageHasSyncedContent(existingPage.id))) {
+    return 'skip-existing-with-content';
+  }
 
-  const originalText = getItemContent(item);
+  const originalText = await getOriginalText(item, link);
   const translatedTitle = await translateText(title, 'Article title');
-  const translatedText = await translateText(
-    originalText.slice(0, TRANSLATE_CHAR_LIMIT),
-    'Article excerpt'
-  );
   const pageTitle = translatedTitle || title;
+  const originalParagraphs = splitIntoParagraphs(originalText, 1800, 35).filter(
+    (paragraph) => paragraph.length > 40
+  );
+  const bilingualPairs = await translateParagraphs(
+    originalParagraphs.join('\n\n').slice(0, TRANSLATE_CHAR_LIMIT).split(/\n{2,}/)
+  );
   const children = buildChildren({
     feedTitle,
-    link,
-    originalText,
-    translatedText,
+    bilingualPairs,
   });
 
   if (existingPage) {

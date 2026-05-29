@@ -15,10 +15,11 @@ jobs:
       RUN_FREQUENCY: 604800
       SYNC_CONTENT: true
       UPDATE_EXISTING: true
+      FETCH_FULL_ARTICLE: true
       TRANSLATE_TO: zh-CN
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL }}
-      OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
+      OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || 'https://api.siliconflow.cn/v1' }}
+      OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'Qwen/Qwen3.5-4B' }}
       DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
     steps:
       - uses: actions/checkout@v4
@@ -42,6 +43,6 @@ jobs:
           mkdir -p "${{ runner.temp }}/rss-sync"
           cd "${{ runner.temp }}/rss-sync"
           npm init -y >/dev/null 2>&1
-          npm install @notionhq/client@0.4.9 rss-parser@3.13.0 --no-save --no-package-lock
+          npm install @notionhq/client@0.4.9 rss-parser@3.13.0 jsdom@24 @mozilla/readability@0.5.0 --no-save --no-package-lock
           cp "$GITHUB_WORKSPACE/notion-sync-lite.js" .
           node notion-sync-lite.js
